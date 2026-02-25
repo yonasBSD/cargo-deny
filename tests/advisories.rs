@@ -4,19 +4,9 @@ use cargo_deny::{
     field_eq, func_name,
     test_utils::{self as tu},
 };
+use std::time::Duration;
 
-fn blocking_client() -> reqwest::blocking::ClientBuilder {
-    let rcs: rustls::RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-    let client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-    .unwrap()
-    .with_root_certificates(rcs)
-    .with_no_client_auth();
-
-    reqwest::blocking::Client::builder().tls_backend_preconfigured(client_config)
-}
+const TEN_THOUSAND_DAYS: Duration = Duration::from_secs(10000 * 24 * 60 * 60);
 
 struct TestCtx {
     dbs: advisories::DbSet,
@@ -52,7 +42,7 @@ fn load() -> TestCtx {
         advisories::DbSet::load(
             "tests/advisory-db".into(),
             vec![],
-            advisories::Fetch::Disallow(time::Duration::days(10000)),
+            advisories::Fetch::Disallow(TEN_THOUSAND_DAYS),
         )
         .unwrap()
     };
@@ -441,7 +431,7 @@ fn fails_on_stale_advisory_database() {
         advisories::DbSet::load(
             "tests/advisory-db".into(),
             vec![],
-            advisories::Fetch::Disallow(time::Duration::seconds(0)),
+            advisories::Fetch::Disallow(Duration::from_secs(0)),
         )
         .unwrap_err()
         .to_string()
@@ -477,8 +467,18 @@ fn do_open(td: &tempfile::TempDir, f: Fetch) -> advisories::AdvisoryDb {
 }
 
 fn validate(adb: &advisories::AdvisoryDb, rev: &str, ids: &[(&str, &str)]) {
-    let repo = gix::open(&adb.path).expect("failed to open repo");
-    assert_eq!(repo.head_commit().unwrap().id.to_hex().to_string(), rev);
+    let mut cmd = std::process::Command::new("git");
+    let output = cmd
+        .arg("-C")
+        .arg(&adb.path)
+        .args(["show", "-s", "--format=%H", "HEAD"])
+        .stdout(std::process::Stdio::piped())
+        .output()
+        .expect("failed to run git");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("not utf8").trim(),
+        rev
+    );
 
     for (id, date) in ids {
         let adv = adb.db.get(&id.parse().unwrap()).expect("unable to find id");
@@ -486,23 +486,10 @@ fn validate(adb: &advisories::AdvisoryDb, rev: &str, ids: &[(&str, &str)]) {
     }
 
     assert!(
-        (time::OffsetDateTime::now_utc() - adb.fetch_time) < std::time::Duration::from_secs(60)
-    );
-}
-
-/// Validates we can clone an advisory database with gix
-#[test]
-fn clones_with_gix() {
-    let td = temp_dir();
-    let db = do_open(&td, Fetch::Allow);
-
-    validate(
-        &db,
-        EXPECTED_TWO,
-        &[
-            (EXPECTED_ONE_ID, EXPECTED_ONE_DATE),
-            (EXPECTED_TWO_ID, EXPECTED_TWO_DATE),
-        ],
+        (jiff::Timestamp::now() - adb.fetch_time)
+            .total(jiff::Unit::Second)
+            .unwrap()
+            < 60.
     );
 }
 
@@ -566,7 +553,7 @@ fn validate_fetch(fetch: Fetch) {
     )
     .expect("failed to write config");
 
-    let db = do_open(&td, Fetch::Disallow(time::Duration::days(10000)));
+    let db = do_open(&td, Fetch::Disallow(TEN_THOUSAND_DAYS));
     validate(&db, EXPECTED_ONE, &[(EXPECTED_ONE_ID, EXPECTED_ONE_DATE)]);
 
     let db = do_open(&td, fetch);
@@ -616,13 +603,10 @@ fn crates_io_source_replacement() {
     {
         use tame_index::index::local;
 
-        let sparse = tame_index::index::RemoteSparseIndex::new(
-            tame_index::SparseIndex::new(tame_index::IndexLocation::new(
-                tame_index::IndexUrl::CratesIoSparse,
-            ))
-            .unwrap(),
-            blocking_client().build().unwrap(),
-        );
+        let sparse = tame_index::SparseIndex::new(tame_index::IndexLocation::new(
+            tame_index::IndexUrl::CratesIoSparse,
+        ))
+        .unwrap();
 
         // Use a separate even more temporary cargo home for the gathering of the
         // crates we want to write to the temp local registry, so that we don't
@@ -671,10 +655,9 @@ fn crates_io_source_replacement() {
             })
             .collect();
 
-        let client = local::builder::Client::build(blocking_client()).unwrap();
-
         let lrb = local::LocalRegistryBuilder::create(to_path(&lrd).unwrap().to_owned()).unwrap();
-        let config = sparse.index.index_config().unwrap();
+        let config = sparse.index_config().unwrap();
+        let agent = ureq::agent();
 
         index_krates.into_par_iter().for_each(|ip| {
             let iv = ip
@@ -683,7 +666,14 @@ fn crates_io_source_replacement() {
                 .iter()
                 .find(|iv| iv.version.parse::<cargo_deny::Version>().unwrap() == ip.version)
                 .unwrap();
-            let vk = local::ValidKrate::download(&client, &config, iv).unwrap();
+
+            let url =
+                config.download_url(iv.name.as_str().try_into().unwrap(), iv.version.as_ref());
+
+            let res = agent.get(url).call().unwrap();
+            let body = res.into_body().read_to_vec().unwrap();
+
+            let vk = local::ValidKrate::validate(body, iv).unwrap();
 
             lrb.insert(&ip.ik, &[vk]).unwrap();
         });
