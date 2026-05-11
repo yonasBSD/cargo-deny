@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Fixed
+- [PR#854](https://github.com/EmbarkStudios/cargo-deny/pull/857) resolved [#854](https://github.com/EmbarkStudios/cargo-deny/issues/854) by removing environment variables that affect repo paths before cloning or fetching the advisory database.
+
 ## [0.19.5] - 2026-05-09
 ### Fixed
 - [PR#857](https://github.com/EmbarkStudios/cargo-deny/pull/857) fixed a segfault reported in [#855](https://github.com/EmbarkStudios/cargo-deny/issues/855).
